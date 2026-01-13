@@ -1,0 +1,420 @@
+---
+title: "Projecte de Visualització de Dades — Healthy Brain Network (HBN)"
+author: "Natalia López López"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+
+# SETUP GENERAL
+# En aquesta pràctica vull fer una visualització que expliqui una història amb dades
+# i que permeti explorar patrons.
+
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 9,
+  fig.height = 5
+)
+
+# Paquets (he triat tidyverse per neteja i ggplot2; plotly i DT per interactivitat)
+library(tidyverse)
+library(janitor)
+library(scales)
+library(plotly)
+library(DT)
+
+# Per palettes accessibles 
+# install.packages("viridis")
+library(viridis)
+
+# Funció petita per mostrar n i percentatge
+fmt_pct <- function(x) paste0(round(x * 100, 1), "%")
+```
+
+# 1. Context i objectiu del projecte
+
+En aquesta segona part de la pràctica, el meu objectiu és **anar més enllà d’un dashboard** i construir una visualització que:
+
+- respongui preguntes concretes de salut emocional i benestar,
+- sigui útil tant per públic general com especialitzat,
+
+
+El conjunt de dades prové del **Healthy Brain Network (HBN)** (OpenNeuro) i en aquesta entrega treballo amb el fitxer `participants.csv`. (A la Part I vaig justificar la rellevància del dataset i les preguntes de recerca.)  
+
+> Preguntes que vull respondre (Part I): diferències per sexe, efecte de l’edat, relació MFQ–SHAPS, diferències per grup clínic, i possible paper de la lateralitat manual.
+En aquest projecte em plantejo cinc preguntes principals:
+(1) si existeixen diferències en els nivells de MFQ i SHAPS segons el sexe,
+(2) com varia el malestar emocional amb l’edat,
+(3) quina relació existeix entre MFQ i SHAPS,
+(4) si els grups clínics mostren patrons diferenciats de malestar,
+i (5) si la lateralitat manual s’associa a diferències emocionals.
+
+
+---
+
+# 2. Carrega de dades i preparació
+
+```{r load-data}
+
+path <- "/Users/natalialopezlopezicloud.com/Desktop/UOC\ /participants.csv"
+
+raw <- readr::read_csv(path, show_col_types = FALSE) %>% 
+  clean_names()
+
+glimpse(raw)
+```
+
+## 2.1 Comprovacions bàsiques i neteja
+
+```{r cleaning}
+# En aquesta secció faig una neteja mínima però transparent:
+# - estandarditzo nivells categòrics,
+# - converteixo edat a numèrica,
+# - gestiono missings (els mantinc, però els controlo per visualització).
+
+df <- raw %>%
+  mutate(
+    sex = as.factor(sex),
+    handedness = as.factor(handedness),
+    group = as.factor(group),
+    age = as.numeric(age),
+    mfq = as.numeric(mfq),
+    shaps = as.numeric(shaps)
+  )
+
+# Resum de missings per variable
+missings <- df %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  arrange(desc(n_missing))
+
+missings
+```
+
+---
+
+# 3. noves variables per tal de tinin un dataset mes optim.
+
+En comptes de limitar-me a les variables originals, creo variables noves per donar **més valor analític** i per facilitar una exploració més rica:
+
+- **bins d’edat** (grups interpretables),
+- **scores estandarditzats** (z-scores) per comparar escales,
+- **índex compost** de “malestar emocional” combinant MFQ (depressió) i SHAPS (anhedonia),
+- **categories de risc** basades en quantils (no és diagnòstic clínic; és una ajuda visual),
+- versions “netes” (sense NA) per a gràfiques específiques.
+
+```{r feature-engineering}
+df2 <- df %>%
+  mutate(
+
+    age_group = case_when(
+      is.na(age) ~ NA_character_,
+      age < 10 ~ "Menys de 10",
+      age >= 10 & age < 13 ~ "10–12",
+      age >= 13 & age < 16 ~ "13–15",
+      age >= 16 & age < 19 ~ "16–18",
+      age >= 19 ~ "19 o més"
+    ) %>% factor(levels = c("Menys de 10", "10–12", "13–15", "16–18", "19 o més")),
+
+    # Estandardització: em permet comparar MFQ i SHAPS en una escala comuna
+    mfq_z = as.numeric(scale(mfq)),
+    shaps_z = as.numeric(scale(shaps)),
+
+    # Índex compostde malestar:
+    # faig la mitjana dels z-scores; així el valor 0 ≈ mitjana mostra
+    distress_index = rowMeans(cbind(mfq_z, shaps_z), na.rm = FALSE),
+
+    # Categories de risc per quantils 
+    distress_q = ntile(distress_index, 4),
+    distress_level = factor(
+      distress_q,
+      levels = 1:4,
+      labels = c("Baix", "Mitjà-baix", "Mitjà-alt", "Alt")
+    )
+  )
+
+# Taula ràpida per veure les noves variables
+df2 %>% 
+  select(participant_id, sex, age, age_group, handedness, group, mfq, shaps,
+         mfq_z, shaps_z, distress_index, distress_level) %>% 
+  head(10)
+```
+
+**Decisió de disseny:** he triat quantils per a `distress_level` perquè és robust quan no tinc llindars clínics oficials dins el fitxer i em permet explicar diferències relatives dins la mostra.
+
+---
+
+# 4. Descripció del conjunt de dades 
+
+
+```{r dataset-summary}
+# Resums descriptius 
+summary_num <- df2 %>%
+  summarise(
+    n = n(),
+    age_min = min(age, na.rm = TRUE),
+    age_med = median(age, na.rm = TRUE),
+    age_max = max(age, na.rm = TRUE),
+    mfq_med = median(mfq, na.rm = TRUE),
+    shaps_med = median(shaps, na.rm = TRUE)
+  )
+
+summary_num
+
+# Distribucions categòriques
+tab_sex <- df2 %>% count(sex) %>% mutate(p = n / sum(n))
+tab_group <- df2 %>% count(group) %>% mutate(p = n / sum(n))
+tab_hand <- df2 %>% count(handedness) %>% mutate(p = n / sum(n))
+
+tab_sex
+tab_group
+tab_hand
+```
+
+---
+
+# 5. Preguntes clau i visualitzacions 
+
+En comptes de mostrar 10 gràfics semblants, estructuro la història en 5 preguntes.  
+Cada pregunta té: **1 visual principal**, i si cal **1 visual secundari** (per no repetir).
+
+## Q1) Hi ha diferències entre sexes en MFQ i SHAPS?
+
+**Decisió de disseny:** faig servir **violin + boxplot** perquè vull veure distribució i mediana.  
+Afegeixo interactivitat amb Plotly per poder llegir valors i n sense omplir la pantalla de text.
+
+```{r q1-sex, fig.height=5}
+d_q1 <- df2 %>% filter(!is.na(sex), !is.na(mfq), !is.na(shaps))
+
+p1 <- ggplot(d_q1, aes(x = sex, y = mfq, fill = sex)) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.15, outlier.alpha = 0.4) +
+  scale_fill_viridis_d(option = "C", end = 0.9) +
+  labs(
+    title = "MFQ per sexe (distribució + mediana)",
+    x = "Sexe",
+    y = "MFQ"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggplotly(p1, tooltip = c("x", "y"))
+```
+Aquest gràfic mostra la distribució de les puntuacions del qüestionari MFQ segons el sexe. Cada violí representa com es distribueixen les puntuacions en dones (F) i homes (M), mentre que la línia central indica la mediana.
+S’observa que les dones presenten una mediana lleugerament més alta que els homes, cosa que suggereix que, en aquesta mostra, tendeixen a reportar més símptomes depressius. A més, la distribució de les dones és una mica més ampla, especialment cap a valors elevats, indicant més variabilitat en les puntuacions.
+Tot i això, hi ha un solapament important entre ambdós grups, fet que indica que molts participants de tots dos sexes tenen puntuacions similars. Per tant, aquestes diferències s’han d’interpretar de manera descriptiva i exploratòria, i no impliquen causalitat ni diagnòstic clínic.
+
+```{r q1b-sex, fig.height=5}
+p1b <- ggplot(d_q1, aes(x = sex, y = shaps, fill = sex)) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.15, outlier.alpha = 0.4) +
+  scale_fill_viridis_d(option = "C", end = 0.9) +
+  labs(
+    title = "SHAPS per sexe (distribució + mediana)",
+    x = "Sexe",
+    y = "SHAPS"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggplotly(p1b, tooltip = c("x", "y"))
+```
+
+
+Aquest gràfic mostra la distribució de les puntuacions del qüestionari SHAPS segons el sexe. Cada violí representa la distribució completa de les puntuacions en dones (F) i homes (M), mentre que la línia central indica la mediana.
+S’observa que els homes presenten una mediana de SHAPS més alta que les dones, cosa que suggereix un nivell més elevat d’anhedonia en aquest grup. A més, la distribució dels homes sembla desplaçada cap a valors més alts, amb una concentració important de puntuacions entre valors mitjans i elevats.
+En canvi, en les dones la distribució és més ampla i heterogènia, amb presència tant de puntuacions baixes com de valors més elevats. Tot i aquestes diferències, hi ha un solapament notable entre ambdós sexes, fet que indica que no hi ha una separació clara entre els grups.
+
+---
+
+## Q2) Com varia la salut emocional segons l’edat?
+
+**Decisió de disseny:** per edat prefereixo:
+- una visió contínua (scatter + smooth) per captar tendència,
+- i una visió per grups (age_group) per facilitar interpretació a públic quye no sigui expert
+
+```{r q2-age-continuous}
+d_q2 <- df2 %>% filter(!is.na(age), !is.na(distress_index))
+
+p2 <- ggplot(d_q2, aes(x = age, y = distress_index)) +
+  geom_point(alpha = 0.35) +
+  geom_smooth(method = "loess", se = TRUE) +
+  labs(
+    title = "Índex de malestar (MFQ+SHAPS) en funció de l’edat",
+    x = "Edat",
+    y = "Índex de malestar (z mitjà)"
+  ) +
+  theme_minimal()
+
+ggplotly(p2, tooltip = c("x", "y"))
+```
+
+Aquest gràfic mostra la relació entre l’edat i l’índex de malestar emocional, que combina les puntuacions estandarditzades de MFQ i SHAPS. Cada punt representa un participant, mentre que la línia blava indica la tendència general i la banda grisa el seu interval d’incertesa.
+En general, no s’observa una relació lineal clara entre l’edat i el malestar emocional. La tendència es manté força estable al voltant del valor zero, que correspon a la mitjana de la mostra. S’intueix un lleuger augment del malestar cap a mitja adolescència (al voltant dels 14–15 anys), seguit d’una petita disminució en edats més avançades.
+Tot i això, la variabilitat individual és elevada a totes les edats, tal com indiquen la dispersió dels punts i l’amplada de la banda grisa. Això suggereix que l’edat, per si sola, no explica les diferències de malestar emocional dins d’aquesta mostra.
+
+```{r q2-age-groups}
+d_q2b <- df2 %>% filter(!is.na(age_group), !is.na(distress_index))
+
+p2b <- ggplot(d_q2b, aes(x = age_group, y = distress_index, fill = age_group)) +
+  geom_boxplot(outlier.alpha = 0.35) +
+  scale_fill_viridis_d(option = "D", end = 0.9) +
+  labs(
+    title = "Distribució de l’índex de malestar per grups d’edat",
+    x = "Grup d’edat",
+    y = "Índex de malestar (z mitjà)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggplotly(p2b, tooltip = c("x", "y"))
+```
+El malestar emocional no mostra canvis clars entre grups d’edat, però sí molta variabilitat individual, especialment durant l’adolescència mitjana.
+---
+
+## Q3) Existeix correlació entre MFQ i SHAPS?
+
+**Decisió de disseny:** faig un scatter amb línia de tendència i color per sexe (si hi ha prou dades), perquè així veig:
+- relació general MFQ–SHAPS,
+- i si aquesta relació canvia per subgrups.
+
+```{r}
+# 1. Dades netes
+d_q3 <- df2 %>% 
+  filter(!is.na(mfq), !is.na(shaps), !is.na(sex))
+
+# 2. Correlació (Pearson)
+cor_test <- cor.test(d_q3$mfq, d_q3$shaps, method = "pearson")
+cor_test
+
+# 3. Gràfic: scatter + línia de tendència per sexe
+p3 <- ggplot(
+  d_q3,
+  aes(x = mfq, y = shaps, color = sex, text = participant_id)
+) +
+  geom_point(alpha = 0.55, size = 2) +
+  geom_smooth(
+    aes(group = sex),
+    method = "lm",
+    se = TRUE,
+    linewidth = 1
+  ) +
+  scale_color_viridis_d(
+    option = "B",
+    end = 0.9,
+    na.value = "grey60"
+  ) +
+  labs(
+    title = "Relació MFQ–SHAPS (amb tendència lineal per sexe)",
+    x = "MFQ (símptomes depressius)",
+    y = "SHAPS (anhedonia)",
+    color = "Sexe"
+  ) +
+  theme_minimal(base_size = 13)
+
+# 4. Versió interactiva
+ggplotly(p3, tooltip = c("text", "x", "y", "color"))
+
+```
+
+
+Aquest gràfic mostra una relació positiva entre les puntuacions de MFQ i SHAPS, indicant que a mesura que augmenten els símptomes depressius també tendeix a augmentar l’anhedonia. Aquesta tendència s’observa tant en dones com en homes, tot i que amb una elevada variabilitat individual. Visualment, la pendent sembla més pronunciada en el grup d’homes, però aquesta diferència s’ha d’interpretar amb prudència i de manera exploratòria.
+---
+
+## Q4) Els grups clínics mostren patrons diferents?
+
+**Decisió de disseny:** aquí em centro en una sola mètrica (distress_index) per no duplicar gràfics.  
+Si `group` té molts nivells, l’interactiu ajuda a explorar sense saturar la pantalla.
+
+```{r q4-group}
+d_q4 <- df2 %>% filter(!is.na(group), !is.na(distress_index))
+
+p4 <- ggplot(d_q4, aes(x = reorder(group, distress_index, median, na.rm = TRUE), y = distress_index)) +
+  geom_boxplot(outlier.alpha = 0.25) +
+  coord_flip() +
+  labs(
+    title = "Índex de malestar per grup clínic (ordenat per mediana)",
+    x = "Grup",
+    y = "Índex de malestar (z mitjà)"
+  ) +
+  theme_minimal()
+
+ggplotly(p4, tooltip = c("x", "y"))
+```
+Aquest gràfic mostra la distribució de l’índex de malestar emocional (basat en MFQ i SHAPS) segons el grup clínic, ordenat per la mediana. Les caixes representen la mediana i el rang interquartílic de cada grup.
+S’observa que el grup MDD presenta una mediana clarament més alta de l’índex de malestar en comparació amb el grup HV. Això indica que, de mitjana, els participants amb diagnòstic de depressió major mostren nivells més elevats de malestar emocional.
+A més, el grup MDD mostra una variabilitat més gran, amb un rang de valors que s’estén tant cap a puntuacions molt elevades com cap a valors més baixos. En canvi, el grup HV presenta una distribució més concentrada i amb valors majoritàriament per sota de la mitjana de la mostra (valors negatius).
+---
+
+## Q5) La lateralitat manual s’associa a diferències emocionals?
+
+**Decisió de disseny:** en lloc d’un altre boxplot, faig una visualització més “comparativa”:
+- percentatges de `distress_level` per handedness (composició).
+Això aporta varietat i és fàcil d’explicar.
+
+```{r q5-handedness}
+d_q5 <- df2 %>%
+  filter(!is.na(handedness), !is.na(distress_level)) %>%
+  count(handedness, distress_level) %>%
+  group_by(handedness) %>%
+  mutate(p = n / sum(n)) %>%
+  ungroup()
+
+p5 <- ggplot(d_q5, aes(x = handedness, y = p, fill = distress_level)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = percent) +
+  scale_fill_viridis_d(option = "A", end = 0.95) +
+  labs(
+    title = "Composició del nivell de malestar per lateralitat manual",
+    x = "Lateralitat manual",
+    y = "Proporció",
+    fill = "Nivell"
+  ) +
+  theme_minimal()
+
+ggplotly(p5, tooltip = c("x", "fill", "y"))
+```
+Aquest gràfic mostra la proporció de participants en cada nivell de malestar emocional segons la lateralitat manual. Cada barra representa el 100% del grup corresponent i es divideix en funció dels nivells de malestar (baix, mitjà-baix, mitjà-alt i alt).
+S’observa que el grup de persones esquerranes presenta majoritàriament nivells baixos de malestar, mentre que en el grup de persones dretanes la distribució és més heterogènia, amb presència de tots els nivells. En el grup ambidextre es detecta una proporció relativament més alta de nivells mitjà-alt i alt, tot i que aquest resultat s’ha d’interpretar amb prudència a causa del nombre reduït de participants.
+---
+
+# 6. Exploració interactiva (taula + filtres “pràctics”)
+
+En aquesta part vull donar una eina real d’exploració: una taula interactiva on puc filtrar per sexe, edat, grup, etc.  
+Això és útil per a públics més tècnics i també per validar ràpidament casos.
+
+```{r interactive-table}
+tab <- df2 %>%
+  select(participant_id, sex, age, age_group, handedness, group, mfq, shaps, distress_index, distress_level) %>%
+  arrange(desc(distress_index))
+
+DT::datatable(
+  tab,
+  filter = "top",
+  options = list(pageLength = 10, scrollX = TRUE),
+  rownames = FALSE
+)
+```
+Aquesta taula interactiva mostra les dades individuals de tots els participants de l’estudi. Cada fila correspon a un participant i cada columna a una de les variables analitzades, com el sexe, l’edat, la lateralitat manual, el grup clínic i les puntuacions en MFQ i SHAPS.
+La interactivitat permet filtrar i ordenar les dades segons diferents criteris, facilitant l’exploració detallada dels casos individuals. Aquesta taula no té com a objectiu extreure conclusions directes, sinó complementar les visualitzacions i garantir la transparència de l’anàlisi.
+---
+
+# 7. Conclusions
+Aquí resumeixo els patrons que veig 
+
+- He observat com varien MFQ i SHAPS per subgrups (sexe / edat / grup).
+- He pogut veure si MFQ i SHAPS estan relacionades i si això canvia per subgrups.
+- L’índex compost m’ha ajudat a explicar la història amb una mètrica única quan necessitava síntesi.
+
+---
+
